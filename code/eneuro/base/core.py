@@ -10,6 +10,7 @@ except ImportError:
 import weakref
 import contextlib
 from functools import total_ordering
+import os
 from eneuro.base import functions as f
 from eneuro.global_config import VISUAL_CONFIG
 import cv2
@@ -321,9 +322,9 @@ def from_dict(d: dict) -> None:  # 序列化读取数据
 def as_array(x):
     """将输入转换为numpy/cupy数组"""
     if isinstance(x, Tensor):
-        if x.device == 'cpu' and isinstance(x.data, cp.ndarray):
+        if x.device == 'cpu' and has_cupy and isinstance(x.data, cp.ndarray):
             x.data = cp.asnumpy(x.data)
-        if (x.device == 'cuda' or x.device == 'gpu') and isinstance(x.data, np.ndarray):
+        if (x.device == 'cuda' or x.device == 'gpu') and has_cupy and isinstance(x.data, np.ndarray):
             x.data = cp.asarray(x.data)
         return as_array(x.data)
     
@@ -393,7 +394,7 @@ class Function:
     def _print_output(self, output_tensor):
         # 和Layer类的_print_output逻辑完全一致（复制粘贴）
         data = output_tensor.data if hasattr(output_tensor, 'data') else output_tensor
-        if isinstance(data, cp.ndarray):
+        if has_cupy and isinstance(data, cp.ndarray):
             data = cp.asnumpy(data)
         if data.ndim != 4:
             return
@@ -431,9 +432,29 @@ class Square(Function):
 def square(x):
     return Square()(x) # you can use square(x) to call the forward method of the Square class
     
+def _cuda_raw_strict():
+    """Read the selected CUDA backend from dispatch rather than the startup environment.
+
+    Benchmarks switch backends in one Python process.  If a RawModule launch
+    fails, this keeps the strict backend from silently falling back to CuPy.
+    """
+    from .cuda import get_backend
+    return get_backend() == 'rawmodule'
+
+
 class Exp(Function):
     def forward(self, x):
         xp = get_array_module(x)
+        # CuPy Tensor 在 rawmodule/auto 模式下尝试调用 CUDA C expf；失败时
+        # auto 回退到 CuPy，strict rawmodule 则把编译/发射错误交给调用者。
+        if xp is not np:
+            try:
+                from .cuda import get_backend, exp_forward
+                if get_backend() in ('rawmodule', 'auto'):
+                    return exp_forward(x)
+            except Exception:
+                if _cuda_raw_strict():
+                    raise
         return xp.exp(x)
 
     def backward(self, gy):
@@ -443,100 +464,18 @@ class Exp(Function):
 def exp(x):
     return Exp()(x) # you can use exp(x) to call the forward method of the Exp clasa
 
-_binary_raw_kernels = {}
-
-
-def _cuda_binary_forward(x0, x1, op):
-    """Broadcast and normalize inputs before a contiguous RawKernel launch."""
-    if op == 'div':
-        out_dtype = cp.true_divide(
-            cp.empty(0, dtype=x0.dtype), cp.empty(0, dtype=x1.dtype)
-        ).dtype
-    else:
-        out_dtype = cp.result_type(x0.dtype, x1.dtype)
-
-    # The common case is already ready for the linear kernel. Defer all
-    # broadcasting, casting, and layout normalization unless it is needed.
-    inputs_are_ready = (
-        x0.shape == x1.shape
-        and x0.dtype == out_dtype
-        and x1.dtype == out_dtype
-        and x0.flags.c_contiguous
-        and x1.flags.c_contiguous
-    )
-    if not inputs_are_ready:
-        x0, x1 = cp.broadcast_arrays(x0, x1)
-        x0 = x0.astype(out_dtype, copy=False)
-        x1 = x1.astype(out_dtype, copy=False)
-        x0 = cp.ascontiguousarray(x0)
-        x1 = cp.ascontiguousarray(x1)
-
-    y = cp.empty(x0.shape, dtype=out_dtype)
-    if y.size == 0:
-        return y
-
-    dtype_name = {
-        cp.dtype('bool'): 'bool',
-        cp.dtype('int8'): 'signed char',
-        cp.dtype('uint8'): 'unsigned char',
-        cp.dtype('int16'): 'short',
-        cp.dtype('uint16'): 'unsigned short',
-        cp.dtype('int32'): 'int',
-        cp.dtype('uint32'): 'unsigned int',
-        cp.dtype('int64'): 'long long',
-        cp.dtype('uint64'): 'unsigned long long',
-        cp.dtype('float16'): 'half',
-        cp.dtype('float32'): 'float',
-        cp.dtype('float64'): 'double',
-        cp.dtype('complex64'): 'complex<float>',
-        cp.dtype('complex128'): 'complex<double>',
-    }.get(cp.dtype(out_dtype))
-    if dtype_name is None:
-        raise TypeError(f'CUDA binary operation does not support dtype {out_dtype}')
-    if op == 'sub' and out_dtype == cp.dtype('bool'):
-        raise TypeError('CUDA boolean subtraction is not supported')
-
-    key = (dtype_name, op)
-    kernel = _binary_raw_kernels.get(key)
-    if kernel is None:
-        expression = {
-            'add': 'a + b',
-            'sub': 'a - b',
-            'mul': 'a * b',
-            'div': 'a / b',
-        }[op]
-        source = f'''#include <cuda_fp16.h>
-#include <cupy/complex.cuh>
-extern "C" __global__ void binary_op(
-    const {dtype_name}* x0, const {dtype_name}* x1, {dtype_name}* y,
-    long long size) {{
-    long long index = (long long)blockDim.x * blockIdx.x + threadIdx.x;
-    if (index >= size) return;
-    {dtype_name} a = x0[index];
-    {dtype_name} b = x1[index];
-    y[index] = {expression};
-}}'''
-        kernel = cp.RawKernel(source, 'binary_op')
-        _binary_raw_kernels[key] = kernel
-
-    threads = 256
-    blocks = (y.size + threads - 1) // threads
-    kernel(
-        (blocks,),
-        (threads,),
-        (
-            x0,
-            x1,
-            y,
-            np.int64(y.size),
-        ),
-    )
-    return y
-
 class Add(Function):
     def forward(self, x0, x1):
         self.x0_shape, self.x1_shape = x0.shape, x1.shape
-        y = _cuda_binary_forward(x0, x1, 'add') if has_cupy and isinstance(x0, cp.ndarray) else x0 + x1
+        # 仅对无广播的同形状 float32 数组走逐元素 kernel；广播仍由 CuPy 完成。
+        if get_array_module(x0) is not np and x0.shape == x1.shape:
+            try:
+                from .cuda import add_forward
+                return add_forward(x0, x1)
+            except Exception:
+                if _cuda_raw_strict():
+                    raise
+        y = x0 + x1
         return y
     
     def backward(self, gy):
@@ -557,7 +496,14 @@ def add(x0, x1):
 class Mul(Function):
     def forward(self, x0, x1):
         self.x0_shape, self.x1_shape = x0.shape, x1.shape
-        y = _cuda_binary_forward(x0, x1, 'mul') if has_cupy and isinstance(x0, cp.ndarray) else x0 * x1
+        if get_array_module(x0) is not np and x0.shape == x1.shape:
+            try:
+                from .cuda import mul_forward
+                return mul_forward(x0, x1)
+            except Exception:
+                if _cuda_raw_strict():
+                    raise
+        y = x0 * x1
         return y
     
     def backward(self, gy):
@@ -579,7 +525,13 @@ def mul(x0, x1):
 
 class Neg(Function):
     def forward(self, x):
-
+        if get_array_module(x) is not np:
+            try:
+                from .cuda import neg_forward
+                return neg_forward(x)
+            except Exception:
+                if _cuda_raw_strict():
+                    raise
         return -x
     
     def backward(self, gy):
@@ -591,7 +543,14 @@ def neg(x):
 class Sub(Function):
     def forward(self, x0, x1):
         self.x0_shape, self.x1_shape = x0.shape, x1.shape
-        y = _cuda_binary_forward(x0, x1, 'sub') if has_cupy and isinstance(x0, cp.ndarray) else x0 - x1
+        if get_array_module(x0) is not np and x0.shape == x1.shape:
+            try:
+                from .cuda import sub_forward
+                return sub_forward(x0, x1)
+            except Exception:
+                if _cuda_raw_strict():
+                    raise
+        y = x0 - x1
         return y
     
     def backward(self, gy):
@@ -620,7 +579,14 @@ def rsub(x0, x1):
 class Div(Function):
     def forward(self, x0, x1):
         self.x0_shape, self.x1_shape = x0.shape, x1.shape
-        y = _cuda_binary_forward(x0, x1, 'div') if has_cupy and isinstance(x0, cp.ndarray) else x0 / x1
+        if get_array_module(x0) is not np and x0.shape == x1.shape:
+            try:
+                from .cuda import div_forward
+                return div_forward(x0, x1)
+            except Exception:
+                if _cuda_raw_strict():
+                    raise
+        y = x0 / x1
         return y
     
     def backward(self, gy):
@@ -653,6 +619,13 @@ class Pow(Function):
         self.c = c
     
     def forward(self, x):
+        if get_array_module(x) is not np:
+            try:
+                from .cuda import pow_forward
+                return pow_forward(x, self.c)
+            except Exception:
+                if _cuda_raw_strict():
+                    raise
         y = x ** self.c
         return y
     

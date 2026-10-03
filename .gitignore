@@ -19,8 +19,6 @@ tests/data.zip
 *.jpg
 *.jpeg
 CLAUDE.md
+saved_models/
+*.pkl
 .vscode/
-
-# Local Codex multi-agent configuration (machine/user-specific)
-AGENTS.md
-.codex/

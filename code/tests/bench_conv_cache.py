@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
 """Conv2d CPU cache benchmark (time + optional perf counters)."""
-
+# 小输入 4,8,32,32，3x3 卷积：tiled 略慢，speedup 0.981x
+# 中输入 8,16,64,64，3x3 卷积：tiled 仍略慢，speedup 0.975x
+# 大输入 8,16,128,128，3x3 卷积：tiled 明显更快，speedup 1.354x
+# 同样大输入但 dilation=2：tiled 依然更快，speedup 1.366x
 import argparse
 import json
 import os

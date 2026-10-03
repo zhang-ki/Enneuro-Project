@@ -443,10 +443,100 @@ class Exp(Function):
 def exp(x):
     return Exp()(x) # you can use exp(x) to call the forward method of the Exp clasa
 
+_binary_raw_kernels = {}
+
+
+def _cuda_binary_forward(x0, x1, op):
+    """Broadcast and normalize inputs before a contiguous RawKernel launch."""
+    if op == 'div':
+        out_dtype = cp.true_divide(
+            cp.empty(0, dtype=x0.dtype), cp.empty(0, dtype=x1.dtype)
+        ).dtype
+    else:
+        out_dtype = cp.result_type(x0.dtype, x1.dtype)
+
+    # The common case is already ready for the linear kernel. Defer all
+    # broadcasting, casting, and layout normalization unless it is needed.
+    inputs_are_ready = (
+        x0.shape == x1.shape
+        and x0.dtype == out_dtype
+        and x1.dtype == out_dtype
+        and x0.flags.c_contiguous
+        and x1.flags.c_contiguous
+    )
+    if not inputs_are_ready:
+        x0, x1 = cp.broadcast_arrays(x0, x1)
+        x0 = x0.astype(out_dtype, copy=False)
+        x1 = x1.astype(out_dtype, copy=False)
+        x0 = cp.ascontiguousarray(x0)
+        x1 = cp.ascontiguousarray(x1)
+
+    y = cp.empty(x0.shape, dtype=out_dtype)
+    if y.size == 0:
+        return y
+
+    dtype_name = {
+        cp.dtype('bool'): 'bool',
+        cp.dtype('int8'): 'signed char',
+        cp.dtype('uint8'): 'unsigned char',
+        cp.dtype('int16'): 'short',
+        cp.dtype('uint16'): 'unsigned short',
+        cp.dtype('int32'): 'int',
+        cp.dtype('uint32'): 'unsigned int',
+        cp.dtype('int64'): 'long long',
+        cp.dtype('uint64'): 'unsigned long long',
+        cp.dtype('float16'): 'half',
+        cp.dtype('float32'): 'float',
+        cp.dtype('float64'): 'double',
+        cp.dtype('complex64'): 'complex<float>',
+        cp.dtype('complex128'): 'complex<double>',
+    }.get(cp.dtype(out_dtype))
+    if dtype_name is None:
+        raise TypeError(f'CUDA binary operation does not support dtype {out_dtype}')
+    if op == 'sub' and out_dtype == cp.dtype('bool'):
+        raise TypeError('CUDA boolean subtraction is not supported')
+
+    key = (dtype_name, op)
+    kernel = _binary_raw_kernels.get(key)
+    if kernel is None:
+        expression = {
+            'add': 'a + b',
+            'sub': 'a - b',
+            'mul': 'a * b',
+            'div': 'a / b',
+        }[op]
+        source = f'''#include <cuda_fp16.h>
+#include <cupy/complex.cuh>
+extern "C" __global__ void binary_op(
+    const {dtype_name}* x0, const {dtype_name}* x1, {dtype_name}* y,
+    long long size) {{
+    long long index = (long long)blockDim.x * blockIdx.x + threadIdx.x;
+    if (index >= size) return;
+    {dtype_name} a = x0[index];
+    {dtype_name} b = x1[index];
+    y[index] = {expression};
+}}'''
+        kernel = cp.RawKernel(source, 'binary_op')
+        _binary_raw_kernels[key] = kernel
+
+    threads = 256
+    blocks = (y.size + threads - 1) // threads
+    kernel(
+        (blocks,),
+        (threads,),
+        (
+            x0,
+            x1,
+            y,
+            np.int64(y.size),
+        ),
+    )
+    return y
+
 class Add(Function):
     def forward(self, x0, x1):
         self.x0_shape, self.x1_shape = x0.shape, x1.shape
-        y = x0 + x1
+        y = _cuda_binary_forward(x0, x1, 'add') if has_cupy and isinstance(x0, cp.ndarray) else x0 + x1
         return y
     
     def backward(self, gy):
@@ -467,7 +557,7 @@ def add(x0, x1):
 class Mul(Function):
     def forward(self, x0, x1):
         self.x0_shape, self.x1_shape = x0.shape, x1.shape
-        y = x0 * x1
+        y = _cuda_binary_forward(x0, x1, 'mul') if has_cupy and isinstance(x0, cp.ndarray) else x0 * x1
         return y
     
     def backward(self, gy):
@@ -501,7 +591,7 @@ def neg(x):
 class Sub(Function):
     def forward(self, x0, x1):
         self.x0_shape, self.x1_shape = x0.shape, x1.shape
-        y = x0 - x1
+        y = _cuda_binary_forward(x0, x1, 'sub') if has_cupy and isinstance(x0, cp.ndarray) else x0 - x1
         return y
     
     def backward(self, gy):
@@ -530,7 +620,7 @@ def rsub(x0, x1):
 class Div(Function):
     def forward(self, x0, x1):
         self.x0_shape, self.x1_shape = x0.shape, x1.shape
-        y = x0 / x1
+        y = _cuda_binary_forward(x0, x1, 'div') if has_cupy and isinstance(x0, cp.ndarray) else x0 / x1
         return y
     
     def backward(self, gy):
